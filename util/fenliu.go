@@ -1,0 +1,535 @@
+package util
+
+import (
+	"errors"
+	"fmt"
+	"github.com/go-redis/redis"
+	"strconv"
+	"strings"
+)
+
+//redis key
+
+const (
+	EXPIRETIME   = "expiretime"   //统计时间
+	LIMITTYPE    = "limittype"    //规则方式，2 异常比例、1 QPS、3 单位时间连续异常
+	CRITICAL     = "critical"     //临界值
+	SLEEPTIME    = "sleeptime"    //恢复半开时间（窗口期）
+	STARTCOUNT   = "startcount"   //达到多少请求开始统计
+	HALF         = "halfcount"    //半开可以进入的请求数
+	HALFTIME     = "halftime"     //半开的窗口时间
+	HALFCRITICAL = "halfcritical" //恢复比例
+
+	ERRCOUNT = "errcount" //错误数
+	COUNT    = "count"    //总数
+
+	HALFCORRECTCOUNT = "halfcorrectcount" //请求正确数目
+	HALFCOUNT        = "halfCount"        //当前请求数目
+
+)
+
+//服务结构体
+type Service struct {
+	prefix         string //前缀
+	suffix         string //后缀
+	halfOpenSetKey string //半开集合key
+	redisClient    *redis.Client
+	hashKey        string // 存取资源key
+}
+
+//限流处理结构体
+type Pass struct {
+	service   *Service
+	resource  string //资源
+	limitType int    //规则类型
+
+}
+
+//创建限流服务
+func NewService(prefix string, suffix string, setKey string, hashKey string, redisClient *redis.Client) (*Service, error) {
+	if redisClient == nil {
+		return nil, errors.New("redisClient is nil")
+	}
+	err := redisClient.Ping().Err()
+	if err != nil {
+		return nil, err
+	}
+	s := &Service{
+		prefix:         prefix,
+		suffix:         suffix,
+		halfOpenSetKey: setKey,
+		redisClient:    redisClient,
+		hashKey:        hashKey,
+	}
+	script := `if redis.call("EXISTS",KEYS[1])==1
+				then
+					return true
+				else
+					redis.call("SADD",KEYS[1],"this_is_an_invalid_key")
+					if redis.call("EXISTS",KEYS[1])==1
+					then
+						return true
+					else
+						return false
+					end
+				end
+`
+	eval := redisClient.Eval(script, []string{s.halfOpenKey()})
+	_, err = eval.Result()
+	if err != nil {
+		return s, err
+	}
+	return s, nil
+
+}
+
+//注册资源
+func (s *Service) AddResource(resource string, expireTime int, limitType int, critical float64, sleepTime int, startCount int, halfCount int, halfTime int, halfCritical float64) error {
+	resourceHashKey := s.resourceHashKey(resource)
+	script := `local result=0
+			result=redis.call("HMSET",KEYS[1],ARGV[1],ARGV[2])
+			assert(result~=false,KEYS[1].." "..ARGV[1].."  failed ")
+			result=redis.call("HMSET",KEYS[1],ARGV[3],ARGV[4])
+			assert(result~=false,KEYS[1].." "..ARGV[3].."  failed ")
+			result=redis.call("HMSET",KEYS[1],ARGV[5],ARGV[6])
+			assert(result~=false,KEYS[1].." "..ARGV[5].."  failed ")
+			result=redis.call("HMSET",KEYS[1],ARGV[7],ARGV[8])
+			assert(result~=false,KEYS[1].." "..ARGV[7].."  failed ")
+			result=redis.call("HMSET",KEYS[1],ARGV[9],ARGV[10])
+			assert(result~=false,KEYS[1].." "..ARGV[9].."  failed ")
+			result=redis.call("HMSET",KEYS[1],ARGV[11],ARGV[12])
+			assert(result~=false,KEYS[1].." "..ARGV[11].."  failed ")
+			result=redis.call("HMSET",KEYS[1],ARGV[13],ARGV[14])
+			assert(result~=false,KEYS[1].." "..ARGV[13].."  failed ")
+			result=redis.call("HMSET",KEYS[1],ARGV[15],ARGV[16])
+			assert(result~=false,KEYS[1].." "..ARGV[15].."  failed ")
+			return true
+`
+	evalRes := s.redisClient.Eval(script, []string{resourceHashKey}, EXPIRETIME, expireTime, LIMITTYPE, limitType, CRITICAL, critical, SLEEPTIME, sleepTime, STARTCOUNT, startCount, HALF, halfCount, HALFTIME, halfTime, HALFCRITICAL, halfCritical)
+	_, err := evalRes.Result()
+	if err != nil {
+		return err
+	}
+
+	return nil
+
+}
+
+//是否通过，没有限流视为通过
+func (s *Service) Take(resource string) (*Pass, int, bool, error) {
+	limitType, islimit, err := s.isLimit(resource)
+	if err != nil {
+		return nil, limitType, false, err
+	}
+	p := &Pass{
+		service:   s,
+		resource:  resource,
+		limitType: limitType,
+	}
+	switch limitType {
+	case 1:
+		if islimit {
+			return nil, limitType, false, nil
+		} else {
+			return nil, limitType, true, nil
+		}
+	default:
+		if islimit {
+			return nil, limitType, false, nil
+		} else {
+			return p, limitType, true, nil
+		}
+
+	}
+
+}
+
+//对资源进行熔断或恢复处理
+func (p *Pass) Pass(isPass bool) error {
+	//通过，考虑是否恢复
+	resourceKey := p.service.resourceKey(p.resource)
+	resourceHashKey := p.service.resourceHashKey(p.resource)
+	halfOpenKey := p.service.halfOpenKey()
+	resourceHalfRecoverKey := p.service.resourceHalfRecover(p.resource)
+	if p.limitType == 1 {
+		return nil
+	}
+	isHalfOpen, err := p.service.isHalfOpen(p.resource)
+	if err != nil {
+		return err
+	}
+	if isPass {
+		//在半开集合
+		//判断是否有recoverkey
+		//有recoverkey达到正常比例恢复
+		if isHalfOpen {
+			// 达到正常比例
+			//移除半开集合
+			str := `
+			local halfcritical = redis.call("HGET",KEYS[1],ARGV[3])
+			assert(halfcritical~=false,KEYS[1].." "..ARGV[3].." is nil or filed Missing")
+			local halfcritical=tonumber(halfcritical)
+			if redis.call("EXISTS",KEYS[2]") == 1 
+			then
+				local halfcorrectcount = redis.call("HGET",KEYS[2],ARGV[1])
+				assert(halfcorrectcount~=false,KEYS[2].." "..ARGV[1].." is nil or filed Missing")
+				local halfCount = redis.call("HGET",KEYS[2],ARGV[2])
+				assert(halfCount~=false,KEYS[2].." "..ARGV[2].." is nil or filed Missing")
+				local halfcorrectcount=tonumber(halfcorrectcount)
+				local halfCount=tonumber(halfCount)
+				if (halfcorrectcount/halfCount) >= halfcritical
+				then 
+					redis.call("DEL",KEYS[2])
+					redis.call("SREM",KEYS[3],KEYS[2])
+				else
+					redis.call("HINCRBY",KEYS[2],ARGV[1],1)
+				end
+			end
+			return true
+`
+			eval := p.service.redisClient.Eval(str, []string{resourceHashKey, resourceHalfRecoverKey, halfOpenKey}, HALFCORRECTCOUNT, HALFCOUNT, HALFCRITICAL)
+			_, err = eval.Result()
+			return err
+		}
+		//总次数加1
+		str := `
+			local exprietime = redis.call("HGET",KEYS[2],ARGV[1])
+			assert(exprietime~=false,KEYS[2].." "..ARGV[1].." is nil or filed Missing")
+			local limittype = redis.call("HGET",KEYS[1],ARGV[2])
+			assert(limittype~=false,KEYS[2].." "..ARGV[2].." is nil or filed Missing")
+			local limittype=tonumber(limittype)
+			local exprietime=tonumber(exprietime)
+		if redis.call("EXISTS",KEYS[1]) ==1
+		then
+			if limittype==3
+			then 
+				redis.call("HSET",KEYS[1],ARGV[3],0)
+			end
+			redis.call("HINCRBY",KEYS[1],ARGV[4],1)
+		else
+			redis.call("HSET",KEYS[1],ARGV[3],0)
+			redis.call("HSET",KEYS[1],ARGV[4],1)
+			redis.call("EXPIRE",KEYS[1],exprietime)
+		end
+		return true
+`
+		eval := p.service.redisClient.Eval(str, []string{resourceKey, resourceHashKey}, EXPIRETIME, LIMITTYPE, ERRCOUNT, COUNT)
+		_, err = eval.Result()
+		if err != nil {
+			return err
+		}
+	} else {
+		//在半开集合中，直接熔断
+		if isHalfOpen {
+			return nil
+		} else {
+			//判断是否达到比例，达到则熔断，errcount+1,count+1
+			//异常比例待思考
+			str := `
+			local exprietime = redis.call("HGET",KEYS[1],ARGV[3])
+			assert(exprietime~=false,KEYS[1].." "..ARGV[3].." is nil or filed Missing")
+			local limittype = redis.call("HGET",KEYS[1],ARGV[4])
+			assert(limittype~=false,KEYS[1].." "..ARGV[4].." is nil or filed Missing")
+			local critical = redis.call("HGET",KEYS[1],ARGV[5])
+			assert(critical~=false,KEYS[1].." "..ARGV[5].." is nil or filed Missing")
+			local sleeptime = redis.call("HGET",KEYS[1],ARGV[6])
+			assert(sleeptime~=false,KEYS[1].." "..ARGV[6].." is nil or filed Missing")
+			local startcount = redis.call("HGET",KEYS[1],ARGV[7])
+			assert(startcount~=false,KEYS[1].." "..ARGV[7].." is nil or filed Missing")
+			local startcount = tonumber(startcount)
+			local limittype = tonumber(limittype)
+			local exprietime = tonumber(exprietime)
+			local critical = tonumber(critical)
+			local sleeptime = tonumber(sleeptime)
+			if redis.call("EXISTS",KEYS[2])
+			then
+			local errcount = redis.call("HGET",KEYS[2],ARGV[1])
+			assert(errcount~=false,KEYS[2].." "..ARGV[1].." is nil or filed Missing")
+			local count = redis.call("HGET",KEYS[2],ARGV[2])
+			assert(count~=false,KEYS[2].." "..ARGV[2].." is nil or filed Missing")
+			local errcount = tonumber(errcount)
+			local count = tonumber(count)
+				if (count+1)>=startcount 
+				then
+					if limittype==2
+					then 
+						if (errcount+1)/(count+1) > critical
+						then
+							redis.call("SADD",KEYS[3],KEYS[2])
+							redis.call("HSET",KEYS[2],ARGV[1],startcount+2)
+							redis.call("HSET",KEYS[2],ARGV[2],startcount+1)
+							redis.call("EXPIRE",KEYS[2],sleeptime)
+
+						else
+							redis.call("HINCRBY",KEYS[2],ARGV[1],1)
+							redis.call("HINCRBY",KEYS[2],ARGV[2],1)
+						end
+					end
+					if limittype==3
+					then
+						if errcount >critical
+						then
+							redis.call("SADD",KEYS[3],KEYS[2])
+							redis.call("HSET",KEYS[2],ARGV[1],critical+1)
+							redis.call("HSET",KEYS[2],ARGV[2],startcount+1)
+							redis.call("EXPIRE",KEYS[2],sleeptime)
+						else
+							redis.call("HINCRBY",KEYS[2],ARGV[1],1)
+							redis.call("HINCRBY",KEYS[2],ARGV[2],1)
+						end
+					end
+				else
+					redis.call("HINCRBY",KEYS[2],ARGV[1],1)
+					redis.call("HINCRBY",KEYS[2],ARGV[2],1)
+				end
+			else
+				redis.call("HSET",KEYS[2],ARGV[1],1)
+				redis.call("HSET",KEYS[2],ARGV[2],1)
+				redis.call("EXPIRE",KEYS[2],exprietime)
+			end
+			return true
+
+`
+			eval := p.service.redisClient.Eval(str, []string{resourceHashKey, resourceKey, halfOpenKey}, ERRCOUNT, COUNT, EXPIRETIME, LIMITTYPE, CRITICAL, SLEEPTIME, STARTCOUNT)
+			_, err := eval.Result()
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+//加锁 放几个请求，其他的按熔断处理
+//判断资源是否限流
+//判断资源的限流方式
+//1.限流 2.异常比例 3 连续错误
+func (s *Service) isLimit(resource string) (int, bool, error) {
+	resourcekey := s.resourceKey(resource)
+	resourceHashKey := s.resourceHashKey(resource)
+	halfOpenKey := s.halfOpenKey()
+	halfRecoverKey := s.resourceHalfRecover(resource)
+
+	script := `
+		local exprietime = redis.call("HGET",KEYS[2],ARGV[8])
+		assert(exprietime~=false,KEYS[2].." "..ARGV[8].." is nil or filed Missing")
+		local limittype = redis.call("HGET",KEYS[2],ARGV[9])
+		assert(limittype~=false,KEYS[2].." "..ARGV[9].." is nil or filed Missing")
+		local critical = redis.call("HGET",KEYS[2],ARGV[10])
+		assert(critical~=false,KEYS[2].." "..ARGV[10].." is nil or filed Missing")
+		local sleeptime = redis.call("HGET",KEYS[2],ARGV[11])
+		assert(sleeptime~=false,KEYS[2].." "..ARGV[11].." is nil or filed Missing")
+		local startcount = redis.call("HGET",KEYS[2],ARGV[12])
+		assert(startcount~=false,KEYS[2].." "..ARGV[12].." is nil or filed Missing")
+		local halfcount = redis.call("HGET",KEYS[2],ARGV[13])
+		assert(halfcount~=false,KEYS[2].." "..ARGV[13].." is nil or filed Missing")
+		local halftime = redis.call("HGET",KEYS[2],ARGV[14])
+		assert(halftime~=false,KEYS[2].." "..ARGV[14].." is nil or filed Missing")
+		local halfcritical = redis.call("HGET",KEYS[2],ARGV[15])
+		assert(halfcritical~=false,KEYS[2].." "..ARGV[15].." is nil or filed Missing")
+		local exprietime = tonumber(exprietime)
+		local limittype = tonumber(limittype)
+		local critical = tonumber(critical)
+		local sleeptime = tonumber(sleeptime)
+		local startcount = tonumber(startcount)
+		local halfcount = tonumber(halfcount)
+		local halftime = tonumber(halftime)
+		local halfcritical = tonumber(halfcritical)
+	if limittype==1
+		then
+		if redis.call("EXISTS",KEYS[1])==1
+		then
+			local	count=redis.call("HGET",KEYS[1],ARGV[4])
+			assert(count~=false,KEYS[1].."的"..ARGV[4].."is nil")
+			local count = tonumber(count)	
+			if (count+1)>critical
+			then
+				-- redis.call("HINCRBY",KEYS[1],ARGV[4],1)
+				return "true,"..limittype
+			else
+				redis.call("HINCRBY",KEYS[1],ARGV[4],1)
+				return "false,"..limittype
+			end
+		else
+			redis.call("HINCRBY",KEYS[1],ARGV[4],1)
+			redis.call("EXPIRE",KEYS[1],exprietime)
+			return "false,"..limittype
+		end
+	end
+	if limittype~=1 
+		then
+		local existshalfset = redis.call("SISMEMBER",KEYS[3],KEYS[1])
+		if redis.call("EXISTS",KEYS[1])==1 
+		then 
+			err=redis.call("HGET",KEYS[1],ARGV[5])
+			assert(err~=false,KEYS[1].." "..ARGV[5].." is nil")
+			count=redis.call("HGET",KEYS[1],ARGV[4])
+			assert(count~=false,KEYS[1].." "..ARGV[4].." is nil")
+			local err = tonumber(err)
+			local count = tonumber(count)
+			if (limittype==2 and count>=startcount)
+				then
+				if (err/count)	>critical
+					then
+					return "true,"..limittype
+				end
+			end
+			if (limittype==3 and count>=startcount)
+				then
+				if err	>critical
+					then
+					return "true,"..limittype
+				end
+			end
+		else
+			if existshalfset==1
+			then
+				if redis.call("HEXISTS",KEYS[4],ARGV[6])==1
+				then
+					if redis.call("HGET",KEYS[4],ARGV[6]) > halfcount
+					then
+						return "true,"..limittype
+					else
+						redis.call("HINCRBY",KEYS[4],ARGV[6],1)
+					end
+				else
+					redis.call("HMEST",KEYS[4],ARGV[6],1)
+					redis.call("HMEST",KEYS[4],ARGV[7],0)
+					redis.call("EXPIRE",KEYS[4],halftime)
+				end
+			end
+			
+		end
+		return "false,"..limittype
+	end
+`
+
+	eval := s.redisClient.Eval(script, []string{resourcekey, resourceHashKey, halfOpenKey, halfRecoverKey}, LIMITTYPE, EXPIRETIME, CRITICAL, COUNT, ERRCOUNT, HALFCOUNT, HALFCORRECTCOUNT, EXPIRETIME, LIMITTYPE, CRITICAL, SLEEPTIME, STARTCOUNT, HALF, HALFTIME, HALFCRITICAL)
+	result, err := eval.Result()
+	fmt.Println("res:|", result)
+	if err != nil {
+		return 0, false, err
+	}
+	r := result.(string)
+	res := strings.Split(r, ",")
+	if len(res) != 2 {
+		return 0, false, errors.New("redis 返回值错误")
+	}
+
+	limittype, err := strconv.Atoi(res[1])
+	fmt.Println("limittype", res[1])
+	if err != nil {
+		return 0, false, err
+	}
+	if res[0] == "true" {
+
+		return limittype, true, err
+	} else if res[0] == "false" {
+		return limittype, false, err
+	}
+	return 0, false, errors.New("未知错误")
+}
+
+//获取资源的redis key
+func (s *Service) resourceKey(resource string) string {
+	return s.prefix + "_" + resource + "_" + s.suffix
+}
+
+//获取保存资源的过期时间、熔断值、熔断方式的rediskey
+func (s *Service) resourceHashKey(resource string) string {
+	return s.prefix + "_" + s.hashKey + "_" + resource + "_" + s.suffix
+}
+
+//获取半开集合在redis中key
+func (s *Service) halfOpenKey() string {
+	return s.prefix + "_" + s.halfOpenSetKey + "_" + s.suffix
+}
+
+//判断是否在半开集合中
+func (s *Service) isHalfOpens(resource []string) ([]bool, error) {
+	var result []bool
+	script := `local rs={}
+		 for word in string.gmatch(ARGV[1], "[%w_]+")
+			do 
+				if redis.call("SISMEMBER",KEYS[1],word)==1
+				then
+					table.insert(rs,"true") 
+				else
+					table.insert(rs,"false")
+				end
+			end
+		return rs
+`
+	eval := s.redisClient.Eval(script, []string{s.halfOpenKey()}, strings.Join(resource, " "))
+	res, err := eval.Result()
+	if err != nil {
+		return result, err
+	}
+	for _, v := range res.([]interface{}) {
+		if v.(string) == "true" {
+			result = append(result, true)
+		} else if v.(string) == "false" {
+			result = append(result, false)
+		}
+	}
+	if len(result) != len(result) {
+		return nil, errors.New("返回的数组元素与传入的数组元素个数不一致")
+	}
+	return result, nil
+}
+
+//判断是否在半开集合中
+func (s *Service) isHalfOpen(resource string) (bool, error) {
+	resourceKey := s.resourceKey(resource)
+	halfOpenKey := s.halfOpenKey()
+
+	script := `if redis.call("SISMEMBER",KEYS[1],ARGV[1])==1
+				then
+					return true
+				else
+					return false
+				end
+`
+	eval := s.redisClient.Eval(script, []string{halfOpenKey}, resourceKey)
+	res, err := eval.Result()
+	if err != nil {
+		return false, err
+	}
+	if res.(string) == "true" {
+		return true, err
+	} else if res.(string) == "false" {
+		return false, err
+	}
+	return false, errors.New("未知错误")
+}
+
+//从半开集合中移除
+func (s *Service) removeHalfOpenSet(resource string) (bool, error) {
+	resourceKey := s.resourceKey(resource)
+	halfOpenKey := s.halfOpenKey()
+	script := `
+	if redis.call("SREM",KEYS[1],ARGV[1]) == 1
+	then
+		return true
+	else
+		return false
+	end
+`
+	eval := s.redisClient.Eval(script, []string{halfOpenKey}, resourceKey)
+	result, err := eval.Result()
+	if err != nil {
+		return false, err
+	}
+	r := result.(string)
+	if r == "true" {
+		return true, nil
+	} else if r == "false" {
+		return false, nil
+	}
+	return false, errors.New("unknow error")
+}
+
+func (s *Service) resourceHalfRecover(resource string) string {
+	return s.prefix + "_" + "halfrecover" + "_" + resource + "_" + s.suffix
+}
