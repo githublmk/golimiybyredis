@@ -2,7 +2,6 @@ package util
 
 import (
 	"errors"
-	"fmt"
 	"github.com/go-redis/redis"
 	"strconv"
 	"strings"
@@ -349,6 +348,7 @@ func (s *Service) isLimit(resource string) (int, bool, error) {
 				return "true,"..limittype
 			else
 				redis.call("HINCRBY",KEYS[1],ARGV[4],1)
+				redis.call("HINCRBY",KEYS[1],ARGV[5],0)
 				return "false,"..limittype
 			end
 		else
@@ -362,9 +362,9 @@ func (s *Service) isLimit(resource string) (int, bool, error) {
 		local existshalfset = redis.call("SISMEMBER",KEYS[3],KEYS[1])
 		if redis.call("EXISTS",KEYS[1])==1 
 		then 
-			err=redis.call("HGET",KEYS[1],ARGV[5])
+			local err=redis.call("HGET",KEYS[1],ARGV[5])
 			assert(err~=false,KEYS[1].." "..ARGV[5].." is nil")
-			count=redis.call("HGET",KEYS[1],ARGV[4])
+			local count=redis.call("HGET",KEYS[1],ARGV[4])
 			assert(count~=false,KEYS[1].." "..ARGV[4].." is nil")
 			local err = tonumber(err)
 			local count = tonumber(count)
@@ -382,6 +382,8 @@ func (s *Service) isLimit(resource string) (int, bool, error) {
 					return "true,"..limittype
 				end
 			end
+			redis.call("HINCRBY",KEYS[1],ARGV[4],1)
+			redis.call("HINCRBY",KEYS[1],ARGV[5],1)
 		else
 			if existshalfset==1
 			then
@@ -394,10 +396,14 @@ func (s *Service) isLimit(resource string) (int, bool, error) {
 						redis.call("HINCRBY",KEYS[4],ARGV[6],1)
 					end
 				else
-					redis.call("HMEST",KEYS[4],ARGV[6],1)
-					redis.call("HMEST",KEYS[4],ARGV[7],0)
+					redis.call("HMSET",KEYS[4],ARGV[6],1)
+					redis.call("HMSET",KEYS[4],ARGV[7],0)
 					redis.call("EXPIRE",KEYS[4],halftime)
 				end
+			else
+				redis.call("HMSET",KEYS[1],ARGV[4],1)
+				redis.call("HMSET",KEYS[1],ARGV[5],1)
+				redis.call("EXPIRE",KEYS[1],exprietime)
 			end
 			
 		end
@@ -407,7 +413,7 @@ func (s *Service) isLimit(resource string) (int, bool, error) {
 
 	eval := s.redisClient.Eval(script, []string{resourcekey, resourceHashKey, halfOpenKey, halfRecoverKey}, LIMITTYPE, EXPIRETIME, CRITICAL, COUNT, ERRCOUNT, HALFCOUNT, HALFCORRECTCOUNT, EXPIRETIME, LIMITTYPE, CRITICAL, SLEEPTIME, STARTCOUNT, HALF, HALFTIME, HALFCRITICAL)
 	result, err := eval.Result()
-	fmt.Println("res:|", result)
+
 	if err != nil {
 		return 0, false, err
 	}
@@ -416,9 +422,7 @@ func (s *Service) isLimit(resource string) (int, bool, error) {
 	if len(res) != 2 {
 		return 0, false, errors.New("redis 返回值错误")
 	}
-
 	limittype, err := strconv.Atoi(res[1])
-	fmt.Println("limittype", res[1])
 	if err != nil {
 		return 0, false, err
 	}
